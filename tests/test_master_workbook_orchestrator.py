@@ -22,6 +22,11 @@ from master_workbook_orchestrator import (
     sanitise_filename,
     static_sheet_names,
 )
+from master_workbook_orchestrator_merged import (
+    OrchestratorError as MergedOrchestratorError,
+    _copy_output as merged_copy_output,
+    run as merged_run,
+)
 from master_workbook_orchestrator_package import _copy_output, run as package_run
 
 
@@ -462,6 +467,103 @@ def test_package_run_records_results_in_each_stress_folder(tmp_path: Path):
     manifests = package_run(master_path)
 
     assert {path.parent.name for path in manifests} == {"one", "two"}
+    for manifest_path in manifests:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert len(manifest["results"]) == 4
+        assert all(result["status"] == "success" for result in manifest["results"])
+
+
+def test_merged_copy_rewrites_retained_formula_references(tmp_path: Path):
+    workbook = _workbook()
+    workbook["Static0"]["A1"] = "='JRL'!A1"
+    combination = Combination(
+        "JRL", "Bonds", "JRL", "1in20", "Transition Matrix", "Spread Matrix"
+    )
+    buffer = BytesIO()
+    workbook.save(buffer)
+
+    destination = merged_copy_output(
+        buffer.getvalue(),
+        workbook,
+        combination,
+        date(2026, 6, 30),
+        tmp_path,
+        DEFAULT_DATA_SHEET_NAME,
+        DEFAULT_SENSITIVITY_SHEET_NAME,
+    )
+
+    from openpyxl import load_workbook
+
+    output = load_workbook(destination, data_only=False)
+    assert output["Static0"]["A1"].value == "='I. Bonds Data'!A1"
+
+
+def test_merged_copy_validates_required_named_inputs(tmp_path: Path):
+    workbook = _workbook()
+    del workbook.defined_names["entity_name"]
+    combination = Combination(
+        "JRL", "Bonds", "JRL", "1in20", "Transition Matrix", "Spread Matrix"
+    )
+    buffer = BytesIO()
+    workbook.save(buffer)
+
+    with pytest.raises(MergedOrchestratorError, match="entity_name"):
+        merged_copy_output(
+            buffer.getvalue(),
+            workbook,
+            combination,
+            date(2026, 6, 30),
+            tmp_path,
+            DEFAULT_DATA_SHEET_NAME,
+            DEFAULT_SENSITIVITY_SHEET_NAME,
+        )
+
+
+def test_merged_copy_rejects_output_sheet_conflict(tmp_path: Path):
+    workbook = _workbook()
+    combination = Combination(
+        "JRL", "Bonds", "JRL", "1in20", "Transition Matrix", "Spread Matrix"
+    )
+    buffer = BytesIO()
+    workbook.save(buffer)
+
+    with pytest.raises(MergedOrchestratorError, match="conflicts"):
+        merged_copy_output(
+            buffer.getvalue(),
+            workbook,
+            combination,
+            date(2026, 6, 30),
+            tmp_path,
+            "Static0",
+            DEFAULT_SENSITIVITY_SHEET_NAME,
+        )
+
+
+def test_merged_run_rejects_collisions_before_writing_outputs(tmp_path: Path):
+    master_path = tmp_path / "master.xlsx"
+    workbook = _workbook()
+    workbook.save(master_path)
+    _, combinations = parse_control(workbook, tmp_path)
+    existing = combinations[0].output_folder / output_name(combinations[0], date(2026, 6, 30))
+    existing.parent.mkdir()
+    existing.write_bytes(b"existing")
+
+    with pytest.raises(FileExistsError):
+        merged_run(master_path)
+
+    assert not list((tmp_path / "two").glob("*.xlsx"))
+
+
+def test_merged_run_creates_outputs_and_manifests(tmp_path: Path):
+    master_path = tmp_path / "master.xlsx"
+    workbook = _composition_workbook()
+    workbook.save(master_path)
+
+    manifests = merged_run(master_path)
+
+    assert {path.parent.name for path in manifests} == {"one", "two"}
+    assert len(list((tmp_path / "one").glob("*.xlsx"))) == 4
+    assert len(list((tmp_path / "two").glob("*.xlsx"))) == 4
     for manifest_path in manifests:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert len(manifest["results"]) == 4

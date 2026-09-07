@@ -19,8 +19,8 @@ if not exist "%MASTER%" (
     pause
     exit /b 2
 )
-echo Running package-level master workbook orchestrator...
-"%PYTHON%" "%SCRIPT_DIR%master_workbook_orchestrator_package.py" --master "%MASTER%" --overwrite
+echo Running consolidated master workbook orchestrator...
+"%PYTHON%" "%SCRIPT_DIR%master_workbook_orchestrator_merged.py" --master "%MASTER%" --overwrite
 set "EXIT_CODE=%ERRORLEVEL%"
 echo.
 if %EXIT_CODE% equ 0 (

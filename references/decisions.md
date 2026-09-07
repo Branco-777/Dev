@@ -49,3 +49,59 @@ the selected entity mapping, and the selected stress row. Add mandatory
 **Rationale:** Each output must be directly usable by the existing Bonds Lite
 workflow while retaining entity- and stress-specific values. Literal values
 avoid external references, and explicit validation prevents malformed outputs.
+
+## Decision 2: Consolidated Package-Level Orchestrator (7 Sep 2026)
+
+**Question:** How should the openpyxl and direct XLSX package orchestrators be
+combined while prioritising performance?
+
+**Decided by:** User
+
+**Choice:** Add one new public runner using direct XLSX package editing as its
+default backend. Centralise Control validation, output-sheet validation,
+formula-reference rewriting, collision handling, result collection, manifest
+writing, and CLI exit status in that runner. Rewrite formulas when source or
+template sheets are renamed. Fail before writing any output when a
+deterministic destination already exists and overwrite is disabled.
+
+**Alternatives considered:**
+- Use openpyxl as the only backend — rejected because the user prioritised
+  performance for the consolidated implementation.
+- Keep two public runners — rejected because it leaves validation and failure
+  behaviour divergent.
+- Preserve old sheet names rather than rewriting formulas — rejected because
+  generated outputs use stable output sheet names and retained formulas must
+  continue to refer to the renamed sheets.
+- Record output collisions per combination — rejected because it can publish a
+  partial run before the user has resolved a deterministic collision.
+
+**Rationale:** One package-level entry point retains the performance benefit
+  while presenting one validated operational contract. Preflight collision
+  checks and atomic workbook writes prevent incomplete or misleading output
+  sets.
+
+### Decision 3: Selective XLSX Startup Loading (7 Sep 2026)
+
+**Question:** Can the approximately 19-second initial workbook load be reduced
+without weakening Control validation or changing generated outputs?
+
+**Decided by:** Agent
+
+**Choice:** Read and decompress the XLSX package once, then build a lightweight
+  validation view from workbook metadata, defined names, and `Global Control`
+  worksheet XML. Keep the original package bytes for output generation and
+  retain openpyxl-compatible helper paths for existing callers.
+
+**Alternatives considered:**
+- Continue using full `openpyxl.load_workbook()` — rejected because it parses
+  large data worksheets that are copied as package parts and not needed for
+  startup validation.
+- Use openpyxl `read_only=True` — rejected because read-only worksheets do not
+  expose the Excel table API required by the Control parser.
+- Parse every worksheet XML part — rejected because only Control cell values,
+  workbook sheet metadata, and defined names are needed before output creation.
+
+**Rationale:** The selective reader reduces the measured startup path from
+  approximately 19 seconds to approximately 0.4 seconds on the shared master
+  workbook while preserving the existing validation contract. The real
+  end-to-end run completed four outputs successfully in 17.29 seconds.

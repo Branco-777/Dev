@@ -2,6 +2,11 @@
 
 This standalone implementation leaves the original workbooks and legacy scripts unchanged.
 
+The consolidated runner is `master_workbook_orchestrator_merged.py`. It uses
+direct XLSX package editing for faster repeated output generation while keeping
+Control validation, formula-reference rewriting, collision handling, and
+manifest behaviour in one entry point.
+
 ## Control contract
 
 The master workbook must contain a worksheet named `Global Control` with these Excel tables:
@@ -18,6 +23,8 @@ The master workbook must also contain `I. Control` and these workbook-scoped nam
 
 Each output workbook has one data sheet, `I. Control`, and one sensitivity sheet, plus the eight static sheets. The data and sensitivity sheets are renamed to `I. Bonds Data` and `I. Sensitivity` by default. Override with `--data-sheet-name` and `--sensitivity-sheet-name`.
 
+Output filenames start with the valuation year and month in `YYYYMM` format. For example, a 30 June 2026 valuation produces names beginning `202606_`.
+
 ## Run
 
 ```text
@@ -26,4 +33,12 @@ python master_workbook_orchestrator.py --master <path> [--overwrite] [--data-she
 
 Or use `run_master_workbook_orchestrator.bat <master-workbook.xlsx>`.
 
+For the consolidated runner, use:
+
+```text
+python master_workbook_orchestrator_merged.py --master <path> [--overwrite] [--data-sheet-name <text>] [--sensitivity-sheet-name <text>]
+```
+
 The master workbook and its control/template sheets are loaded read-only in practice: this tool never saves them. Each output is written through a temporary file and a JSON manifest records successes and failures in each distinct stress output folder. Existing outputs are rejected unless `--overwrite` is supplied. The suffix and output folder from each selected stress row are used for its outputs. There is no global output folder or `--output-folder` override.
+
+Startup validation reads the XLSX package directly and parses only workbook metadata and the `Global Control` sheet. It does not load the large data worksheets through openpyxl, which keeps initial validation fast while preserving the same control, named-input, sheet, and table checks.
