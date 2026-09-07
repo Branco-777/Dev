@@ -24,7 +24,6 @@ CONTROL_SHEET = "Global Control"
 ENTITY_TABLE = "tbl_entity_mapping"
 STRESS_TABLE = "tbl_stress_selection"
 SETTINGS_TABLE = "tbl_run_settings"
-DATA_SHEETS = {"JRL", "JRL MAP", "PLACL", "PLACL MAP"}
 EXPECTED_STATIC_SHEETS = 8
 DEFAULT_DATA_SHEET_NAME = "I. Bonds Data"
 DEFAULT_SENSITIVITY_SHEET_NAME = "I. Sensitivity"
@@ -190,6 +189,28 @@ def _setting(rows: list[dict[str, Any]], name: str) -> Any:
     return values[0]
 
 
+def _entity_source_sheets(workbook: Any) -> set[str]:
+    """Return and validate all source worksheets listed in the entity table.
+
+    Args:
+        workbook: Open master workbook containing the entity mapping table.
+
+    Returns:
+        The distinct source worksheet names listed in the entity table.
+
+    Raises:
+        OrchestratorError: If a source worksheet is blank or does not exist in
+            the master workbook.
+    """
+    source_sheets = set()
+    for row in _table_rows(workbook, ENTITY_TABLE):
+        source_sheet = _required_text(row, "SourceSheet", ENTITY_TABLE)
+        if source_sheet not in workbook.sheetnames:
+            raise OrchestratorError(f"Missing SourceSheet tab: {source_sheet}")
+        source_sheets.add(source_sheet)
+    return source_sheets
+
+
 def _parse_date(value: Any) -> date:
     """Convert a supported Excel or ISO date value to a date.
 
@@ -265,6 +286,7 @@ def parse_control(workbook: Any, base_folder: Path | None = None) -> tuple[date,
     mappings = _table_rows(workbook, ENTITY_TABLE)
     stresses = _table_rows(workbook, STRESS_TABLE)
     settings = _table_rows(workbook, SETTINGS_TABLE)
+    _entity_source_sheets(workbook)
 
     selected_mappings: list[tuple[str, str, str]] = []
     seen_mappings: set[tuple[str, str]] = set()
@@ -276,8 +298,6 @@ def parse_control(workbook: Any, base_folder: Path | None = None) -> tuple[date,
         if key in seen_mappings:
             raise OrchestratorError(f"Duplicate entity/category mapping: {entity}/{category}")
         seen_mappings.add(key)
-        if source_sheet not in DATA_SHEETS:
-            raise OrchestratorError(f"Unsupported source sheet: {source_sheet}")
         if _selected(row.get("Selected")):
             selected_mappings.append((entity, category, source_sheet))
 
@@ -364,12 +384,13 @@ def static_sheet_names(workbook: Any, excluded: set[str] | None = None) -> list[
         for tab_name in (row.get("Transition Tab"), row.get("Spread Tab"))
         if isinstance(tab_name, str) and tab_name.strip()
     }
+    source_tabs = _entity_source_sheets(workbook)
     static = [
         name
         for name in workbook.sheetnames
         if name != CONTROL_SHEET
         and name not in (excluded or set())
-        and name not in DATA_SHEETS
+        and name not in source_tabs
         and name != CONTROL_OUTPUT_SHEET
         and name not in stress_tabs
         and not (name.startswith("Sensitivities - ") or name.startswith("Sensitivities_"))

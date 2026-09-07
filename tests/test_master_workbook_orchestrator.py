@@ -187,6 +187,34 @@ def test_parse_control_rejects_mismatched_stress_sheet():
         parse_control(workbook)
 
 
+def test_parse_control_accepts_existing_source_sheet_from_entity_table():
+    workbook = _workbook()
+    workbook["Global Control"]["C2"] = "Custom Data"
+    workbook["JRL"].title = "Custom Data"
+
+    _, combinations = parse_control(workbook)
+
+    assert combinations[0].source_sheet == "Custom Data"
+
+
+def test_static_sheet_rule_excludes_custom_source_sheet_from_entity_table():
+    workbook = _workbook()
+    workbook["Global Control"]["C2"] = "Custom Data"
+    workbook["JRL"].title = "Custom Data"
+
+    assert static_sheet_names(
+        workbook, {"Transition Matrix", "Spread Matrix", "I. Sensitivity - Template"}
+    ) == [f"Static{i}" for i in range(8)]
+
+
+def test_parse_control_rejects_missing_source_sheet_from_entity_table():
+    workbook = _workbook()
+    workbook["Global Control"]["C2"] = "Missing Data"
+
+    with pytest.raises(OrchestratorError, match="SourceSheet.*Missing Data"):
+        parse_control(workbook)
+
+
 def test_static_sheet_rule_finds_eight_sheets():
     assert static_sheet_names(_workbook(), {"Transition Matrix", "Spread Matrix", "I. Sensitivity - Template"}) == [
         f"Static{i}" for i in range(8)
