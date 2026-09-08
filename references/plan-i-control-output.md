@@ -55,7 +55,7 @@ defined names continue to point to the corresponding cells on `I. Control`.
 5. **Integrate output ordering** in `copy_combination()` so `I. Control` is
    copied as a dedicated sheet, alongside the data sheet, composed sensitivity
    sheet, and eight static sheets. Ensure it is not a static-sheet candidate.
-6. **Update documentation** in `README-master-workbook-orchestrator.md`, the
+6. **Update documentation** in `README.md`, the
    existing master plan, and the decision record with the two new settings, the
    seven named inputs, output values, and explicit-sheet count.
 
@@ -92,7 +92,7 @@ Follow the red-green-refactor sequence from the `testing-strategy` skill.
   and copy `I. Control`, and preserve defined names.
 - `tests/test_master_workbook_orchestrator.py` — fixture, validation, and
   end-to-end output assertions.
-- `README-master-workbook-orchestrator.md` — document the expanded settings
+- `README.md` — document the expanded settings
   and output contract.
 - `references/plan-master-workbook-orchestrator.md` — record this feature.
 - `references/decisions.md` — record the user-approved design choices.

@@ -1,4 +1,21 @@
-"""Generate stress-specific workbooks through one package-level runner."""
+"""Generate stress-specific workbooks through one package-level runner.
+
+The runner treats the master workbook as an input package. It validates the
+``Global Control`` sheet, expands the selected entity/category and stress
+combinations, and creates one filtered workbook for each combination. Workbook
+XML is edited directly so large data worksheets do not need to be loaded into
+``openpyxl`` during validation or copied through a slower object model.
+
+The public workflow is:
+
+1. Call :func:`run` with the master workbook path.
+2. Read and validate the control tables with :func:`parse_control`.
+3. Copy and update one workbook package for each returned combination.
+4. Write a manifest beside each distinct stress output folder.
+
+The master workbook is never modified. Output files are written to temporary
+files and moved into place only after the package has been fully created.
+"""
 
 from __future__ import annotations
 
@@ -76,12 +93,26 @@ for _prefix, _namespace in XML_NAMESPACES.items():
 
 
 class OrchestratorError(ValueError):
-    """Raised when the master workbook does not meet the Control contract."""
+    """Raised when the master workbook violates the control-sheet contract."""
 
 
 @dataclass(frozen=True)
 class Combination:
-    """Describe one entity, category, and stress output combination."""
+    """Describe one entity, category, and stress output combination.
+
+    Attributes:
+        entity: Entity name written to the generated ``I. Control`` sheet.
+        category: Entity category used to identify the output.
+        source_sheet: Master-workbook sheet containing the selected data.
+        stress: Human-readable stress name.
+        transition_tab: Worksheet containing the transition matrix source.
+        spread_tab: Worksheet containing the spread matrix source.
+        stress_suffix: Suffix written to the generated control values and name.
+        output_folder: Resolved destination folder for the output workbook.
+        risk_factor_path: Path passed through to the generated control sheet.
+        bool_inv_exp: Investment-expense setting passed through unchanged.
+        output_folder_value: Original folder value from the control table.
+    """
 
     entity: str
     category: str
@@ -98,7 +129,14 @@ class Combination:
 
 @dataclass
 class RunResult:
-    """Record the result of one attempted output workbook."""
+    """Record the result of one attempted output workbook.
+
+    Attributes:
+        combination: JSON-serialisable combination details.
+        output_path: Created workbook path, or ``None`` after a failure.
+        status: ``"success"`` or ``"failed"``.
+        error: Failure message when ``status`` is ``"failed"``.
+    """
 
     combination: dict[str, Any]
     output_path: str | None
@@ -108,38 +146,63 @@ class RunResult:
 
 @dataclass(frozen=True)
 class _XmlCell:
+    """Represent the value needed from one cell in a package worksheet."""
+
     value: Any = None
 
 
 @dataclass(frozen=True)
 class _XmlTable:
+    """Represent the range reference needed from one Excel table."""
+
     ref: str
 
 
 class _XmlWorksheet:
+    """Expose the small worksheet interface required by control validation."""
+
     def __init__(
         self,
         sheet_state: str,
         tables: dict[str, _XmlTable],
         values: dict[str, Any],
     ) -> None:
+        """Initialise worksheet metadata and parsed cell values.
+
+        Args:
+            sheet_state: Excel worksheet state, such as ``"visible"`` or
+                ``"hidden"``.
+            tables: Tables indexed by their display name.
+            values: Parsed cell values indexed by Excel coordinate.
+        """
         self.sheet_state = sheet_state
         self.tables = tables
         self._values = values
 
     def cell(self, row: int, column: int) -> _XmlCell:
+        """Return the value at a one-based row and column coordinate."""
         coordinate = f"{get_column_letter(column)}{row}"
         return _XmlCell(self._values.get(coordinate))
 
 
 class _XmlDefinedName:
+    """Represent a workbook-scoped or worksheet-scoped defined name."""
+
     def __init__(self, name: str, value: str, local_sheet_id: int | None) -> None:
+        """Initialise a defined name from workbook XML attributes.
+
+        Args:
+            name: Defined-name identifier.
+            value: Formula or cell reference stored in the workbook.
+            local_sheet_id: Worksheet scope, or ``None`` for workbook scope.
+        """
         self.name = name
         self.value = value
         self.localSheetId = local_sheet_id
 
     @property
     def destinations(self) -> list[tuple[str, str]]:
+        """Return simple worksheet/cell destinations referenced by the name."""
         match = re.fullmatch(r"'((?:[^']|'')+)'!((?:\$?[A-Z]{1,3})\$?\d+)", self.value)
         if match is None:
             match = re.fullmatch(r"([A-Za-z0-9_. ]+)!((?:\$?[A-Z]{1,3})\$?\d+)", self.value)
@@ -149,24 +212,40 @@ class _XmlDefinedName:
 
 
 class _XmlDefinedNames:
+    """Provide name lookup for parsed workbook defined names."""
+
     def __init__(self, values: dict[str, _XmlDefinedName]) -> None:
+        """Store defined names indexed by their workbook name."""
         self._values = values
 
     def get(self, name: str) -> _XmlDefinedName | None:
+        """Return a defined name, or ``None`` when it is not present."""
         return self._values.get(name)
 
 
 class _XmlWorkbook:
+    """Minimal workbook representation used during package-level validation."""
+
     def __init__(self, worksheets: dict[str, _XmlWorksheet], defined_names: _XmlDefinedNames) -> None:
+        """Initialise worksheet metadata and defined-name lookup."""
         self._worksheets = worksheets
         self.sheetnames = list(worksheets)
         self.defined_names = defined_names
 
     def __getitem__(self, name: str) -> _XmlWorksheet:
+        """Return a worksheet by its exact Excel sheet name."""
         return self._worksheets[name]
 
 
 def _date_style_ids(parts: dict[str, bytes]) -> set[int]:
+    """Find style IDs that should be interpreted as dates or date-times.
+
+    Args:
+        parts: XLSX package parts indexed by package path.
+
+    Returns:
+        Style IDs using built-in or custom date-like number formats.
+    """
     styles = _read_xml(parts, "xl/styles.xml")
     date_format_ids = {14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30, 31, 32, 33, 34, 45, 46, 47}
     custom_formats = {
@@ -186,6 +265,14 @@ def _date_style_ids(parts: dict[str, bytes]) -> set[int]:
 
 
 def _shared_strings(parts: dict[str, bytes]) -> list[str]:
+    """Read the shared-string table from an XLSX package, if present.
+
+    Args:
+        parts: XLSX package parts indexed by package path.
+
+    Returns:
+        Shared strings in the order used by worksheet cell references.
+    """
     if "xl/sharedStrings.xml" not in parts:
         return []
     root = _read_xml(parts, "xl/sharedStrings.xml")
@@ -197,6 +284,16 @@ def _xml_cell_values(
     shared_strings: list[str],
     date_style_ids: set[int],
 ) -> dict[str, Any]:
+    """Parse worksheet cell values needed by the control-table reader.
+
+    Args:
+        root: Worksheet XML root element.
+        shared_strings: Workbook shared-string values.
+        date_style_ids: Style IDs that represent dates or date-times.
+
+    Returns:
+        Cell values indexed by their Excel coordinates.
+    """
     values: dict[str, Any] = {}
     for cell in root.iter(_tag("c")):
         coordinate = cell.attrib.get("r")
@@ -229,6 +326,20 @@ def _xml_cell_values(
 
 
 def _load_package_workbook(parts: dict[str, bytes]) -> _XmlWorkbook:
+    """Build a lightweight workbook model from XLSX package metadata.
+
+    Only the control worksheet's cells and tables are parsed. Other worksheet
+    data is intentionally left in the package for direct copying later.
+
+    Args:
+        parts: XLSX package parts indexed by package path.
+
+    Returns:
+        Workbook metadata suitable for control validation.
+
+    Raises:
+        OrchestratorError: If the workbook has no worksheet collection.
+    """
     workbook_root = _read_xml(parts, "xl/workbook.xml")
     relationships = _relationship_parts(parts, "xl/workbook.xml")
     shared_strings = _shared_strings(parts)
@@ -268,6 +379,19 @@ def _load_package_workbook(parts: dict[str, bytes]) -> _XmlWorkbook:
 
 
 def _table_rows(workbook: Any, table_name: str) -> list[dict[str, Any]]:
+    """Read one control-table range as a list of row dictionaries.
+
+    Args:
+        workbook: Workbook-like object exposing ``sheetnames`` and worksheet
+            tables.
+        table_name: Required Excel table name on ``Global Control``.
+
+    Returns:
+        One dictionary per data row, keyed by the table headings.
+
+    Raises:
+        OrchestratorError: If the control sheet, table, or headings are invalid.
+    """
     if CONTROL_SHEET not in workbook.sheetnames:
         raise OrchestratorError(f"Missing required worksheet: {CONTROL_SHEET}")
     worksheet = workbook[CONTROL_SHEET]
@@ -285,6 +409,19 @@ def _table_rows(workbook: Any, table_name: str) -> list[dict[str, Any]]:
 
 
 def _required_text(row: dict[str, Any], key: str, table_name: str) -> str:
+    """Return a required, trimmed text field from a control-table row.
+
+    Args:
+        row: Control-table row values.
+        key: Required field name.
+        table_name: Table name used in validation errors.
+
+    Returns:
+        The trimmed field value.
+
+    Raises:
+        OrchestratorError: If the field is missing, blank, or not text.
+    """
     value = row.get(key)
     if not isinstance(value, str) or not value.strip():
         raise OrchestratorError(f"{table_name} requires a non-blank {key}")
@@ -292,10 +429,23 @@ def _required_text(row: dict[str, Any], key: str, table_name: str) -> str:
 
 
 def _selected(value: Any) -> bool:
+    """Interpret the supported truthy values used by control tables."""
     return value is True or str(value).strip().lower() in {"yes", "true", "1", "selected"}
 
 
 def _setting(rows: list[dict[str, Any]], name: str) -> Any:
+    """Return exactly one run-setting value, allowing configured aliases.
+
+    Args:
+        rows: Rows from ``tbl_run_settings``.
+        name: Canonical setting name.
+
+    Returns:
+        The configured setting value.
+
+    Raises:
+        OrchestratorError: If zero or multiple matching settings exist.
+    """
     accepted_names = {value.casefold() for value in SETTING_ALIASES.get(name, {name})}
     values = [
         row.get("Value")
@@ -308,6 +458,17 @@ def _setting(rows: list[dict[str, Any]], name: str) -> Any:
 
 
 def _entity_source_sheets(workbook: Any) -> set[str]:
+    """Validate and collect source worksheets configured for entities.
+
+    Args:
+        workbook: Workbook-like object containing the control tables.
+
+    Returns:
+        Unique source-sheet names referenced by entity mappings.
+
+    Raises:
+        OrchestratorError: If a mapping is incomplete or its sheet is missing.
+    """
     source_sheets = set()
     for row in _table_rows(workbook, ENTITY_TABLE):
         source_sheet = _required_text(row, "SourceSheet", ENTITY_TABLE)
@@ -318,6 +479,17 @@ def _entity_source_sheets(workbook: Any) -> set[str]:
 
 
 def _parse_date(value: Any) -> date:
+    """Convert a control-sheet valuation date to a ``date`` instance.
+
+    Args:
+        value: Excel date, date-time, or ISO date value.
+
+    Returns:
+        The normalised valuation date.
+
+    Raises:
+        OrchestratorError: If ``value`` is not a supported date value.
+    """
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
@@ -331,6 +503,18 @@ def _parse_date(value: Any) -> date:
 
 
 def _control_named_cells(workbook: Any) -> dict[str, str]:
+    """Validate required named inputs and return their target cell addresses.
+
+    Args:
+        workbook: Workbook-like object containing defined names.
+
+    Returns:
+        Mapping from required input name to one cell on ``I. Control``.
+
+    Raises:
+        OrchestratorError: If the control sheet, names, scope, or destinations
+            do not match the output-workbook contract.
+    """
     if CONTROL_OUTPUT_SHEET not in workbook.sheetnames:
         raise OrchestratorError(f"Missing required worksheet: {CONTROL_OUTPUT_SHEET}")
     named_cells: dict[str, str] = {}
@@ -351,6 +535,24 @@ def _control_named_cells(workbook: Any) -> dict[str, str]:
 
 
 def parse_control(workbook: Any, base_folder: Path | None = None) -> tuple[date, list[Combination]]:
+    """Validate control tables and expand them into output combinations.
+
+    Entity mappings and selected stresses are combined as a Cartesian product.
+    Stress output folders are resolved relative to ``base_folder`` when the
+    control value is relative.
+
+    Args:
+        workbook: Workbook-like object containing the control sheet and tabs.
+        base_folder: Folder used to resolve relative stress output folders.
+            Defaults to the current working directory when omitted.
+
+    Returns:
+        A pair containing the valuation date and all selected combinations.
+
+    Raises:
+        OrchestratorError: If any required table value, worksheet, setting, or
+            selection is invalid.
+    """
     mappings = _table_rows(workbook, ENTITY_TABLE)
     stresses = _table_rows(workbook, STRESS_TABLE)
     settings = _table_rows(workbook, SETTINGS_TABLE)
@@ -438,6 +640,22 @@ def parse_control(workbook: Any, base_folder: Path | None = None) -> tuple[date,
 
 
 def static_sheet_names(workbook: Any, excluded: set[str] | None = None) -> list[str]:
+    """Derive the static worksheets retained in every generated workbook.
+
+    The control sheet, output control sheet, configured source and matrix tabs,
+    sensitivity sheets, and explicitly excluded names are removed. The
+    remaining set must contain the expected number of static worksheets.
+
+    Args:
+        workbook: Workbook-like object containing sheet names and control tables.
+        excluded: Additional sheet names to exclude for the current output.
+
+    Returns:
+        Static sheet names in their original workbook order.
+
+    Raises:
+        OrchestratorError: If the derived count is not the expected count.
+    """
     stress_tabs = {
         tab_name
         for row in _table_rows(workbook, STRESS_TABLE)
@@ -461,12 +679,31 @@ def static_sheet_names(workbook: Any, excluded: set[str] | None = None) -> list[
 
 
 def sanitise_filename(value: str) -> str:
+    """Replace characters that are invalid in Windows filenames.
+
+    Args:
+        value: Candidate filename component.
+
+    Returns:
+        A safe, non-blank filename component.
+    """
     result = INVALID_FILENAME_CHARS.sub("_", value).strip().rstrip(".")
     return result or "unnamed"
 
 
 def output_name(combination: Combination, valuation_date: date) -> str:
-    parts = [valuation_date.strftime("%Y%m"), combination.entity, combination.category, combination.stress]
+    """Build the deterministic filename for one output combination.
+
+    Args:
+        combination: Entity, category, and stress suffix details for the output.
+        valuation_date: Date included in the filename prefix.
+
+    Returns:
+        Sanitised workbook filename in the format
+        ``YYYYMM_<entity>_<category>_<suffix>.xlsx``. The stress name is not
+        included because the suffix identifies the selected stress output.
+    """
+    parts = [valuation_date.strftime("%Y%m"), combination.entity, combination.category]
     if combination.stress_suffix:
         parts.append(combination.stress_suffix)
     return "_".join(sanitise_filename(part) for part in parts) + ".xlsx"
@@ -477,6 +714,17 @@ def _validate_output_sheet_names(
     sensitivity_sheet_name: str,
     static_names: list[str],
 ) -> None:
+    """Validate requested output names against Excel and retained-sheet rules.
+
+    Args:
+        data_sheet_name: Name assigned to the selected source sheet.
+        sensitivity_sheet_name: Name assigned to the generated sensitivity sheet.
+        static_names: Static worksheet names retained in the output.
+
+    Raises:
+        OrchestratorError: If a name is blank, too long, invalid, duplicated,
+            or conflicts with a retained worksheet.
+    """
     names = (data_sheet_name, sensitivity_sheet_name)
     if any(not name.strip() for name in names):
         raise OrchestratorError("Output sheet names must be non-blank")
@@ -493,22 +741,31 @@ def _validate_output_sheet_names(
 
 
 def _tag(name: str) -> str:
+    """Return an XML tag qualified with the spreadsheet namespace."""
     return f"{{{MAIN_NS}}}{name}"
 
 
 def _local_name(tag: str) -> str:
+    """Return the local name from a namespace-qualified XML tag."""
     return tag.rsplit("}", 1)[-1]
 
 
 def _relationship_target(source_part: str, target: str) -> str:
+    """Resolve a package relationship target relative to its source part."""
     return posixpath.normpath(posixpath.join(posixpath.dirname(source_part), target)).lstrip("/")
 
 
 def _read_xml(parts: dict[str, bytes], name: str) -> ET.Element:
+    """Parse one XML package part and return its root element."""
     return ET.fromstring(parts[name])
 
 
 def _write_xml(parts: dict[str, bytes], name: str, root: ET.Element) -> None:
+    """Serialise an XML root back into its named package part.
+
+    The namespace declarations used by Excel's markup-compatibility attributes
+    are restored when ``ElementTree`` omits them during serialisation.
+    """
     serialised = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     ignorable = re.search(rb"\bmc:Ignorable=\"([^\"]+)\"", serialised)
     if ignorable is not None:
@@ -525,6 +782,16 @@ def _write_xml(parts: dict[str, bytes], name: str, root: ET.Element) -> None:
 
 
 def _relationship_parts(parts: dict[str, bytes], part: str) -> dict[str, tuple[str, str]]:
+    """Read relationships for one package part.
+
+    Args:
+        parts: XLSX package parts indexed by package path.
+        part: Package path whose ``.rels`` file should be read.
+
+    Returns:
+        Relationship ID mapped to relationship type and resolved target path.
+        An empty dictionary is returned when no relationship file exists.
+    """
     rels_name = f"{posixpath.dirname(part)}/_rels/{posixpath.basename(part)}.rels"
     if rels_name not in parts:
         return {}
@@ -539,6 +806,7 @@ def _relationship_parts(parts: dict[str, bytes], part: str) -> dict[str, tuple[s
 
 
 def _sheet_parts(parts: dict[str, bytes]) -> dict[str, str]:
+    """Map workbook worksheet names to their package part paths."""
     workbook = _read_xml(parts, "xl/workbook.xml")
     relationships = _relationship_parts(parts, "xl/workbook.xml")
     sheets = workbook.find("main:sheets", NS)
@@ -551,6 +819,18 @@ def _sheet_parts(parts: dict[str, bytes]) -> dict[str, str]:
 
 
 def _cell(root: ET.Element, coordinate: str) -> ET.Element:
+    """Return or create a worksheet cell at an Excel coordinate.
+
+    Args:
+        root: Worksheet XML root element.
+        coordinate: Cell coordinate such as ``"D10"``.
+
+    Returns:
+        The existing or newly created cell element.
+
+    Raises:
+        OrchestratorError: If ``coordinate`` does not contain a row number.
+    """
     for cell in root.iter(_tag("c")):
         if cell.attrib.get("r") == coordinate:
             return cell
@@ -568,6 +848,13 @@ def _cell(root: ET.Element, coordinate: str) -> ET.Element:
 
 
 def _set_cell_value(root: ET.Element, coordinate: str, value: Any) -> None:
+    """Replace a cell's stored value while preserving unrelated cell metadata.
+
+    Args:
+        root: Worksheet XML root element.
+        coordinate: Cell coordinate to update.
+        value: Boolean, text, date, number, or ``None`` value to store.
+    """
     cell = _cell(root, coordinate)
     for child in list(cell):
         if _local_name(child.tag) in {"f", "v", "is"}:
@@ -590,6 +877,7 @@ def _set_cell_value(root: ET.Element, coordinate: str, value: Any) -> None:
 
 
 def _table_parts(parts: dict[str, bytes], sheet_part: str) -> list[tuple[ET.Element, str]]:
+    """Return table XML roots and package paths linked to one worksheet."""
     worksheet = _read_xml(parts, sheet_part)
     relationships = _relationship_parts(parts, sheet_part)
     table_parts = worksheet.find("main:tableParts", NS)
@@ -604,6 +892,7 @@ def _table_parts(parts: dict[str, bytes], sheet_part: str) -> list[tuple[ET.Elem
 
 
 def _table_by_name(parts: dict[str, bytes], sheet_part: str) -> dict[str, tuple[ET.Element, str]]:
+    """Index a worksheet's table XML by Excel table name."""
     return {
         table.attrib["name"]: (table, part)
         for table, part in _table_parts(parts, sheet_part)
@@ -611,6 +900,7 @@ def _table_by_name(parts: dict[str, bytes], sheet_part: str) -> dict[str, tuple[
 
 
 def _copy_value(source_root: ET.Element, target_root: ET.Element, source_coordinate: str, target_coordinate: str) -> None:
+    """Copy a cell's value or formula from one worksheet XML tree to another."""
     source = _cell(source_root, source_coordinate)
     target = _cell(target_root, target_coordinate)
     for child in list(target):
@@ -626,6 +916,17 @@ def _copy_value(source_root: ET.Element, target_root: ET.Element, source_coordin
 
 
 def _populate_matrix(source_root: ET.Element, target_root: ET.Element, source_table: ET.Element, target_table: ET.Element) -> None:
+    """Copy a matrix table cell-for-cell into a target table.
+
+    Args:
+        source_root: Worksheet containing the source matrix.
+        target_root: Worksheet containing the target matrix tables.
+        source_table: Source table element and range.
+        target_table: Target table element and range.
+
+    Raises:
+        OrchestratorError: If source and target matrix dimensions differ.
+    """
     source_min_col, source_min_row, source_max_col, source_max_row = range_boundaries(source_table.attrib["ref"])
     target_min_col, target_min_row, target_max_col, target_max_row = range_boundaries(target_table.attrib["ref"])
     source_shape = (source_max_col - source_min_col, source_max_row - source_min_row)
@@ -642,6 +943,21 @@ def _populate_matrix(source_root: ET.Element, target_root: ET.Element, source_ta
 
 
 def _populate_sensitivity_package(parts: dict[str, bytes], sheet_parts: dict[str, str], combination: Combination) -> None:
+    """Populate the hidden sensitivity template with selected stress matrices.
+
+    Transition tables receive the matrix from ``combination.transition_tab``;
+    spread and original-spread tables receive the matrix from
+    ``combination.spread_tab``.
+
+    Args:
+        parts: Mutable XLSX package parts for one output.
+        sheet_parts: Worksheet-name to package-part mapping.
+        combination: Stress matrix selection for this output.
+
+    Raises:
+        OrchestratorError: If source tabs do not contain exactly one table, a
+            table has an unknown purpose, or matrix dimensions differ.
+    """
     target_sheet = sheet_parts[SENSITIVITY_TEMPLATE_SHEET]
     transition_sheet = sheet_parts[combination.transition_tab]
     spread_sheet = sheet_parts[combination.spread_tab]
@@ -668,6 +984,7 @@ def _populate_sensitivity_package(parts: dict[str, bytes], sheet_parts: dict[str
 
 
 def _rename_sheet_references(formula: str, renames: dict[str, str]) -> str:
+    """Rewrite worksheet references in a formula according to ``renames``."""
     for old_name, new_name in renames.items():
         pattern = re.compile(rf"(?<![A-Za-z0-9_])(?:'{re.escape(old_name)}'|{re.escape(old_name)})!")
         formula = pattern.sub(f"'{new_name}'!", formula)
@@ -675,6 +992,7 @@ def _rename_sheet_references(formula: str, renames: dict[str, str]) -> str:
 
 
 def _has_sheet_reference(formula: str, sheet_name: str) -> bool:
+    """Return whether a formula contains a reference to ``sheet_name``."""
     pattern = re.compile(rf"(?:'{re.escape(sheet_name)}'|{re.escape(sheet_name)})!")
     return bool(pattern.search(formula))
 
@@ -685,6 +1003,14 @@ def _rewrite_worksheet_formulas(
     retained_names: set[str],
     renames: dict[str, str],
 ) -> None:
+    """Update formulas on retained worksheets after sheet names change.
+
+    Args:
+        parts: Mutable XLSX package parts for one output.
+        sheet_parts: Worksheet-name to package-part mapping.
+        retained_names: Worksheets that remain in the generated workbook.
+        renames: Old-to-new worksheet names used by the output.
+    """
     for sheet_name in retained_names:
         part = sheet_parts.get(sheet_name)
         if part is None:
@@ -709,6 +1035,28 @@ def _update_workbook(
     data_sheet_name: str,
     sensitivity_sheet_name: str,
 ) -> dict[str, str]:
+    """Filter and rename worksheets in one output workbook package.
+
+    The selected data sheet, control sheet, sensitivity template, and static
+    sheets are retained. All other worksheets and worksheet relationships are
+    removed. Formulas and workbook-scoped names are then updated to use the new
+    output sheet names; names depending on removed worksheets are discarded.
+
+    Args:
+        parts: Mutable XLSX package parts for one output.
+        combination: Entity and source-sheet selection for this output.
+        static_names: Static worksheet names to retain.
+        named_cells: Required control input names and their cell addresses.
+        data_sheet_name: Output name for the selected source sheet.
+        sensitivity_sheet_name: Output name for the sensitivity template.
+
+    Returns:
+        Worksheet-name to package-part mapping captured before renaming.
+
+    Raises:
+        OrchestratorError: If workbook XML is missing required worksheet data or
+            a named control coordinate is invalid.
+    """
     workbook = _read_xml(parts, "xl/workbook.xml")
     relationships = _read_xml(parts, "xl/_rels/workbook.xml.rels")
     sheet_parts = _sheet_parts(parts)
@@ -766,6 +1114,15 @@ def _update_workbook(
 
 
 def _control_values(combination: Combination, valuation_date: date) -> dict[str, Any]:
+    """Build values written to the generated ``I. Control`` sheet.
+
+    Args:
+        combination: Selected entity, stress, and control settings.
+        valuation_date: Validated valuation date for the output.
+
+    Returns:
+        Mapping from required named input to its output cell value.
+    """
     return {
         "valuation_date": valuation_date,
         "entity_name": combination.entity,
@@ -788,6 +1145,31 @@ def _copy_output(
     named_cells: dict[str, str] | None = None,
     master_parts: dict[str, bytes] | None = None,
 ) -> Path:
+    """Create one filtered output workbook from the master package.
+
+    The package is copied in memory, updated for the requested combination, and
+    written to a temporary file in the destination folder. ``os.replace`` then
+    publishes the completed workbook atomically.
+
+    Args:
+        master_bytes: Original master workbook bytes.
+        workbook: Lightweight validated workbook model.
+        combination: Entity, category, and stress selection to generate.
+        valuation_date: Date written to the output control sheet and filename.
+        output_folder: Destination folder for the workbook.
+        data_sheet_name: Output name for the selected source worksheet.
+        sensitivity_sheet_name: Output name for the sensitivity worksheet.
+        named_cells: Optional prevalidated control-name cell mapping.
+        master_parts: Optional decompressed package parts shared across outputs.
+
+    Returns:
+        Path to the published output workbook.
+
+    Raises:
+        FileExistsError: If the deterministic output path already exists.
+        OrchestratorError: If required workbook sheets or package structures are
+            invalid.
+    """
     named_cells = named_cells or _control_named_cells(workbook)
     if SENSITIVITY_TEMPLATE_SHEET not in workbook.sheetnames:
         raise OrchestratorError(f"Missing sensitivity template sheet: {SENSITIVITY_TEMPLATE_SHEET}")
@@ -841,7 +1223,14 @@ def _copy_output(
 
 
 def _decompress_parts(master_bytes: bytes) -> dict[str, bytes]:
-    """Decompress every package part once so outputs can share it without re-reading the ZIP."""
+    """Decompress every package part once for reuse across generated outputs.
+
+    Args:
+        master_bytes: Complete master XLSX package.
+
+    Returns:
+        Package parts indexed by their ZIP member path.
+    """
     with ZipFile(BytesIO(master_bytes)) as source_package:
         return {name: source_package.read(name) for name in source_package.namelist()}
 
@@ -852,6 +1241,28 @@ def run(
     data_sheet_name: str = DEFAULT_DATA_SHEET_NAME,
     sensitivity_sheet_name: str = DEFAULT_SENSITIVITY_SHEET_NAME,
 ) -> list[Path]:
+    """Generate all selected workbooks and write per-folder manifests.
+
+    The run is divided into loading, validation, preflight, output generation,
+    and manifest-writing stages. Validation and collision checks happen before
+    any output is created. Individual output failures are recorded in the
+    relevant manifest while other combinations continue to run.
+
+    Args:
+        master_path: Path to the read-only master workbook.
+        overwrite: Whether existing deterministic output files may be replaced.
+        data_sheet_name: Name for the selected source sheet in each output.
+        sensitivity_sheet_name: Name for the populated sensitivity sheet.
+
+    Returns:
+        Manifest paths, one for each distinct stress output folder.
+
+    Raises:
+        FileNotFoundError: If ``master_path`` does not exist.
+        FileExistsError: If an output exists and ``overwrite`` is false.
+        OSError: If the master or output folders cannot be read or written.
+        OrchestratorError: If control values or workbook structure are invalid.
+    """
     started = time.perf_counter()
     print(f"[1/5] Loading master workbook package: {master_path}")
     master_bytes = master_path.read_bytes()
@@ -939,6 +1350,12 @@ def run(
 
 
 def main() -> int:
+    """Parse command-line arguments, run orchestration, and return an exit code.
+
+    Returns:
+        ``0`` when every generated output succeeds, otherwise ``1``. Argument
+        and workbook errors are reported through ``argparse``.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--master", required=True, type=Path)
     parser.add_argument("--overwrite", action="store_true")

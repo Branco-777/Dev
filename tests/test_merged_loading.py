@@ -95,5 +95,5 @@ def test_output_name_uses_compact_valuation_year_and_month():
     )
 
     assert orchestrator.output_name(combination, date(2026, 6, 30)) == (
-        "202606_JRL_Bonds_1in20_1in20Comb.xlsx"
+        "202606_JRL_Bonds_1in20Comb.xlsx"
     )

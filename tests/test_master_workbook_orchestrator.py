@@ -246,7 +246,7 @@ def test_sanitise_filename_removes_windows_characters():
 
 def test_output_name_is_deterministic():
     combination = Combination("JRL", "Bonds", "JRL", "1in20", "Transition Matrix", "Spread Matrix", "1in20Comb")
-    assert output_name(combination, date(2026, 6, 30)) == "2026-06-30_JRL_Bonds_1in20_1in20Comb.xlsx"
+    assert output_name(combination, date(2026, 6, 30)) == "202606_JRL_Bonds_1in20Comb.xlsx"
 
 
 def test_output_name_uses_stress_suffix_when_no_override_is_provided():
@@ -254,7 +254,7 @@ def test_output_name_uses_stress_suffix_when_no_override_is_provided():
         "JRL", "Bonds", "JRL", "Credit Combined 1 in 20", "Transition Matrix", "Spread Matrix", "1in20Comb"
     )
     assert output_name(combination, date(2026, 6, 30)) == (
-        "2026-06-30_JRL_Bonds_Credit Combined 1 in 20_1in20Comb.xlsx"
+        "202606_JRL_Bonds_1in20Comb.xlsx"
     )
 
 

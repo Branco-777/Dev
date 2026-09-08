@@ -155,7 +155,7 @@ location. There is no global output-folder CLI override.
   stale launcher references if needed.
 - `README.md` — document the Control sheet contract, naming rules, setup, and
   run procedures.
-- `README-master-workbook-orchestrator.md` — document the per-stress
+- `README.md` — document the per-stress
   `OutputFolder` column and remove the global setting and CLI option.
 - `run_master_workbook_orchestrator.bat` — accept only the master workbook and
   stop forwarding a global output folder.
